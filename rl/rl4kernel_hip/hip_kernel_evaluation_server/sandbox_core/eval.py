@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import re
 import time
 import traceback
 from dataclasses import asdict, replace
@@ -58,8 +59,17 @@ class CompileStageResult(NamedTuple):
     tmp_dir_created: bool
 
 
+_PYBIND_MODULE = re.compile(r"PYBIND11_MODULE\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)")
+
+
 def _candidate_module_name(request: EvalRequest) -> str:
-    return f'hip_{request.kernel_name}'
+    # torch cpp_extension.load(name=...) must match PYBIND11_MODULE. A literal
+    # module name in the candidate is what the .so exports; TORCH_EXTENSION_NAME
+    # follows the load name, so the hashed hip_* name stays valid.
+    match = _PYBIND_MODULE.search(request.hip_code or "")
+    if match and match.group(1) != "TORCH_EXTENSION_NAME":
+        return match.group(1)
+    return f"hip_{request.kernel_name}"
 
 
 def _candidate_build_directory(tmp_dir: str) -> str:

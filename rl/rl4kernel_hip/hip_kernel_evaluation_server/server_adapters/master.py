@@ -28,6 +28,7 @@ from sandbox_core.logging_utils import (
 )
 from sandbox_core.protocol import BatchEvalRequest, BatchEvalResponse, EvalRequest, EvalResponse
 from sandbox_core.result import EvalRunResult
+from server_adapters.tool_router import router as tool_router
 
 RUNTIME_LOG_DIR = Path(__file__).resolve().parent.parent / "runtime" / "logs"
 RUNTIME_LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -114,6 +115,9 @@ class GPUSlotManager:
         self.speedup_confirm_iterations = self.settings_dict.get("speedup_confirm_iterations", 3000)
         self.error_log_dir = self.settings_dict.get("error_log_dir", "./error_log")
         self.local_executor = None
+        self.slot_policy = _slot_policy()
+        # Shared by every in-flight HTTP request. Created on the serving loop.
+        self._free_slots: asyncio.Queue | None = None
         os.makedirs(self.error_log_dir, exist_ok=True)
         self.eval_settings = load_eval_settings(
             perf_iterations=self.perf_iterations,
@@ -144,7 +148,43 @@ class GPUSlotManager:
             for gpu_id in range(num_gpus):
                 self.slots.append(GPUSlot(node_type="remote", node_host=host, node_port=port, gpu_id=gpu_id))
             logger.info(f"Added remote worker: {host}:{port} with {num_gpus} GPUs")
-        logger.info(f"Total GPU slots: {len(self.slots)}")
+        logger.info(f"Total GPU slots: {len(self.slots)} policy={self.slot_policy}")
+
+    def _ensure_free_slots(self) -> asyncio.Queue:
+        if self._free_slots is None:
+            self._free_slots = asyncio.Queue()
+            for slot in self.slots:
+                self._free_slots.put_nowait(slot)
+        return self._free_slots
+
+    def _annotate(self, response: EvalResponse, slot: GPUSlot) -> EvalResponse:
+        timing = dict(response.timing or {})
+        timing["assigned_gpu"] = slot.gpu_id
+        timing["assigned_node"] = slot.node_host
+        timing["assigned_node_type"] = slot.node_type
+        timing["slot_policy"] = self.slot_policy
+        response.timing = timing
+        return response
+
+    async def _execute_and_annotate(self, slot: GPUSlot, task: EvalRequest, batch_tmp_dir: str) -> EvalResponse:
+        logger.info(
+            "slot assign kernel=%s node_type=%s node=%s gpu=%s policy=%s",
+            task.kernel_name,
+            slot.node_type,
+            slot.node_host,
+            slot.gpu_id,
+            self.slot_policy,
+        )
+        response = await self.execute_on_slot(slot, task, batch_tmp_dir)
+        return self._annotate(response, slot)
+
+    async def _run_on_free_slot(self, task: EvalRequest, batch_tmp_dir: str) -> EvalResponse:
+        free_slots = self._ensure_free_slots()
+        slot = await free_slots.get()
+        try:
+            return await self._execute_and_annotate(slot, task, batch_tmp_dir)
+        finally:
+            free_slots.put_nowait(slot)
 
     def get_total_slots(self) -> int:
         return len(self.slots)
@@ -210,11 +250,17 @@ class GPUSlotManager:
         if not tasks:
             return []
         num_slots = len(self.slots)
-        logger.info(f"Dispatching {len(tasks)} tasks across {num_slots} GPU slots")
-        coroutines = []
-        for idx, task in enumerate(tasks):
-            slot = self.slots[idx % num_slots]
-            coroutines.append(self.execute_on_slot(slot, task, batch_tmp_dir))
+        if num_slots == 0:
+            raise RuntimeError("no GPU slots configured")
+        logger.info(f"Dispatching {len(tasks)} tasks across {num_slots} GPU slots policy={self.slot_policy}")
+        if self.slot_policy == "legacy":
+            # Request-local index. A one-kernel request is always task 0, so it always uses slot 0.
+            coroutines = [
+                self._execute_and_annotate(self.slots[idx % num_slots], task, batch_tmp_dir)
+                for idx, task in enumerate(tasks)
+            ]
+        else:
+            coroutines = [self._run_on_free_slot(task, batch_tmp_dir) for task in tasks]
         results = await asyncio.gather(*coroutines, return_exceptions=True)
         responses = []
         for idx, result in enumerate(results):
@@ -244,23 +290,30 @@ class GPUSlotManager:
         return results
 
 
+def _slot_policy() -> str:
+    policy = os.environ.get("HIP_SLOT_POLICY", "queue").strip().lower()
+    if policy not in {"queue", "legacy"}:
+        logger.warning(f"Unknown HIP_SLOT_POLICY={policy!r}; using queue")
+        return "queue"
+    return policy
+
+
 def _run_local_evaluation(
     task_payload: Dict,
     tmp_dir: str,
     gpu_id: int,
     error_log_file: str,
     settings_payload: Dict,
-) -> Tuple[bool, bool, bool, float, Dict]:
+) -> EvalRunResult:
     settings = eval_settings_from_payload(settings_payload)
     task = EvalRequest(**task_payload)
-    result = run_eval_request(
+    return run_eval_request(
         task,
         tmp_dir=tmp_dir,
         gpu_id=gpu_id,
         error_log_file=error_log_file,
         settings=settings,
     )
-    return result.compile_ok, result.run_ok, result.match_ok, result.speedup, result.timing
 
 
 CONFIG_PATH = os.environ.get("WORKER_CONFIG", "workers.yaml")
@@ -272,6 +325,7 @@ app = FastAPI(
     version="1.1.0",
     description="Multi-node distributed HIP kernel evaluation server",
 )
+app.include_router(tool_router)
 
 
 @app.on_event("startup")
@@ -301,6 +355,7 @@ def health():
         "total_slots": slot_manager.get_total_slots(),
         "local_slots": slot_manager.get_local_slots(),
         "remote_slots": slot_manager.get_remote_slots(),
+        "slot_policy": slot_manager.slot_policy,
         "perf_iterations": slot_manager.perf_iterations,
         "effective_arch": slot_manager.eval_settings.effective_arch,
         "compile_cache_enabled": slot_manager.eval_settings.enable_ref_compile_cache,
