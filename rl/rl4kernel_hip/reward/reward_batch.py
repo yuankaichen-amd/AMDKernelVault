@@ -99,6 +99,10 @@ def _get_env_float(name: str, default: float) -> float:
         return default
 
 
+def _copy_requires_kernel_body() -> bool:
+    return str(os.environ.get("REWARD_COPY_REQUIRE_KERNEL_BODY", "0")).strip().lower() in ("1", "true", "yes")
+
+
 def _coerce_optional_float(value: T.Any, source_name: str) -> Optional[float]:
     if value is None:
         return None
@@ -412,12 +416,14 @@ def call_batch_run_code(url: str, requests_data: List[dict], timeout_s: int = 60
         "requests": requests_data
     }
     
-    resp = requests.post(
-        batch_url,
-        json=batch_payload,
-        timeout=timeout_s
-    )
-    return resp
+    # A dropped connection would otherwise zero every sample in the batch; evaluation is idempotent.
+    for attempt in range(3):
+        try:
+            return requests.post(batch_url, json=batch_payload, timeout=timeout_s)
+        except requests.exceptions.ConnectionError:
+            if attempt == 2:
+                raise
+            time.sleep(5 * (attempt + 1))
 
 
 def _parse_solution_response(
@@ -827,6 +833,9 @@ def compute_score_batch(
             if hip_ref_code and hip_gen_code:
                 try:
                     dtw_to_ref, token_len = compute_dtw_to_ref(hip_ref_code, hip_gen_code, kernel_name)
+                    if token_len == 0 and _copy_requires_kernel_body():
+                        # kernel_name is often the PyTorch module name, not a __global__ symbol.
+                        dtw_to_ref, token_len = compute_dtw_to_ref(hip_ref_code, hip_gen_code, None)
                     _print_transient_reward_block(
                         title=f"[DTW] kernel={kernel_name}",
                         lines=[
@@ -1402,6 +1411,9 @@ def _compute_single_score_correct_speedup_copy_penalty(
 
     d_ref = float(dtw_to_ref)
     copy_candidate = d_ref < d_copy
+    if token_len <= 0 and _copy_requires_kernel_body():
+        # No comparable kernel body (missing reference or failed extraction): d_ref=0 is not evidence of copying.
+        copy_candidate = False
 
     if not compile_ok:
         r_final = 0.0
